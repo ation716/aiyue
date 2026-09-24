@@ -11,7 +11,11 @@ from mysql_config import make_mysql_config
 
 def init_database_and_table(conn: pymysql.connections.Connection, db_name: str, table_name: str):
     """
-    初始化数据库和数据表。只负责创建包含原始日线信息的表，不搞复杂的逻辑。
+    初始化数据库和精简的原始日线表。
+
+    表只保留后续计算需要的字段：symbol、日期、OHLC、成交量（手）、换手率
+    百分数值和流通股本。流通市值可由 close * outstanding_share 在查询时计算，
+    因此不重复存储。
 
     参数:
         conn: pymysql 数据库连接对象
@@ -25,40 +29,58 @@ def init_database_and_table(conn: pymysql.connections.Connection, db_name: str, 
     # 切换到目标数据库
     conn.select_db(db_name)
 
-    # 2. 创建干净的数据表
+    # 2. 创建精简的原始日线表。
+    # 设计口径：主板代码只保留六位 symbol；交易所后缀可由 symbol 前缀推导。
+    # turnover_rate 统一存百分数值，例如 0.074530 -> 7.453。
     create_table_sql = f"""
         CREATE TABLE IF NOT EXISTS `{table_name}` (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
-            ts_code VARCHAR(16) NOT NULL COMMENT '带有后缀的代码，如 000001.SZ',
-            symbol VARCHAR(8) NOT NULL COMMENT '纯数字代码，如 000001',
+            id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            symbol CHAR(6) NOT NULL COMMENT '六位代码，如 000001 或 600000',
             trade_date DATE NOT NULL COMMENT '交易日期',
-            open DECIMAL(12,4) NULL COMMENT '开盘价',
-            high DECIMAL(12,4) NULL COMMENT '最高价',
-            low DECIMAL(12,4) NULL COMMENT '最低价',
-            close DECIMAL(12,4) NULL COMMENT '收盘价',
-            change_amount DECIMAL(12,4) NULL COMMENT '涨跌额',
-            pct_chg DECIMAL(10,4) NULL COMMENT '涨跌幅百分比',
-            vol DECIMAL(20,4) NULL COMMENT '成交量（手）',
-            amount DECIMAL(20,4) NULL COMMENT '成交额（元）',
-            turnover_rate DECIMAL(10,4) NULL COMMENT '换手率（百分比）',
-            outstanding_share DECIMAL(20,2) NULL COMMENT '流通股本（股）',
-            float_mv DECIMAL(26,4) NULL COMMENT '流通市值（元），估算值',
-            UNIQUE KEY uk_code_date (ts_code, trade_date),
+            open DECIMAL(8,2) NULL COMMENT '开盘价，元/股',
+            high DECIMAL(8,2) NULL COMMENT '最高价，元/股',
+            low DECIMAL(8,2) NULL COMMENT '最低价，元/股',
+            close DECIMAL(8,2) NULL COMMENT '收盘价，元/股',
+            vol BIGINT UNSIGNED NULL COMMENT '成交量，手',
+            turnover_rate DECIMAL(7,3) NULL COMMENT '换手率，百分数值；10 表示 10%',
+            outstanding_share BIGINT UNSIGNED NULL COMMENT '流通股本，股',
+            UNIQUE KEY uk_symbol_date (symbol, trade_date),
             KEY idx_trade_date (trade_date)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """
     with conn.cursor() as cursor:
         cursor.execute(create_table_sql)
-        
-        # 兼容处理：检查字段是否已存在，没有就加上
         cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
         existing_cols = {row[0] for row in cursor.fetchall()}
-        for col_name, col_def in [
-            ("outstanding_share", "DECIMAL(20,2) NULL"),
-            ("float_mv", "DECIMAL(26,4) NULL")
-        ]:
-            if col_name not in existing_cols:
-                cursor.execute(f"ALTER TABLE `{table_name}` ADD COLUMN `{col_name}` {col_def}")
+
+        # 旧版本把 turnover 保存成小数比例；迁移到新口径时转换为百分数值。
+        if "ts_code" in existing_cols and "turnover_rate" in existing_cols:
+            cursor.execute(
+                f"UPDATE `{table_name}` SET `turnover_rate` = `turnover_rate` * 100 "
+                "WHERE `turnover_rate` IS NOT NULL AND `turnover_rate` BETWEEN 0 AND 1"
+            )
+        # 旧表兼容迁移：压缩保留字段的类型。
+        for column, definition in {
+            "symbol": "CHAR(6) NOT NULL",
+            "open": "DECIMAL(8,2) NULL",
+            "high": "DECIMAL(8,2) NULL",
+            "low": "DECIMAL(8,2) NULL",
+            "close": "DECIMAL(8,2) NULL",
+            "vol": "BIGINT UNSIGNED NULL",
+            "turnover_rate": "DECIMAL(7,3) NULL",
+            "outstanding_share": "BIGINT UNSIGNED NULL",
+        }.items():
+            if column in existing_cols:
+                cursor.execute(f"ALTER TABLE `{table_name}` MODIFY COLUMN `{column}` {definition}")
+        cursor.execute(f"SHOW INDEX FROM `{table_name}`")
+        index_names = {row[2] for row in cursor.fetchall()}
+        if "uk_code_date" in index_names:
+            cursor.execute(f"ALTER TABLE `{table_name}` DROP INDEX `uk_code_date`")
+        for col_name in ("ts_code", "change_amount", "pct_chg", "amount", "float_mv"):
+            if col_name in existing_cols:
+                cursor.execute(f"ALTER TABLE `{table_name}` DROP COLUMN `{col_name}`")
+        if "uk_symbol_date" not in index_names:
+            cursor.execute(f"ALTER TABLE `{table_name}` ADD UNIQUE KEY `uk_symbol_date` (`symbol`, `trade_date`)")
     conn.commit()
 
 
@@ -131,13 +153,10 @@ def batch_insert_klines(conn: pymysql.connections.Connection, table_name: str, s
     if df is None or df.empty:
         return
 
-    # 生成带后缀的 ts_code (用于做唯一主键)
-    ts_code = f"{symbol}.SH" if symbol.startswith("6") else f"{symbol}.SZ"
-
     # 将 dataframe 转为可以直接写库的 List[Tuple]
     records = []
     for _, row in df.iterrows():
-        # ak.stock_zh_a_daily (新浪源) 返回的字段名为英文
+        # ak.stock_zh_a_daily（新浪源）返回英文列名；成交额读取但不入库。
         trade_date_raw = row.get("date")
         if not trade_date_raw:
             continue
@@ -155,26 +174,22 @@ def batch_insert_klines(conn: pymysql.connections.Connection, table_name: str, s
         low_p = safe_float(row.get("low"))
         close_p = safe_float(row.get("close"))
         
-        # Sina 接口原生可能不带涨跌幅，设为 None (后期可用 Pandas 补全)
-        change_amount = None
-        pct_chg = None
-        
         vol = safe_float(row.get("volume"))
-        amount = safe_float(row.get("amount"))
-        turnover_rate = safe_float(row.get("turnover"))  # Sina接口的换手率列名通常为 turnover
+        if vol is not None:
+            vol = int(round(vol))
 
-        # 提取流通股本（单位：股）
+        turnover_rate = safe_float(row.get("turnover"))
+        if turnover_rate is not None:
+            turnover_rate *= 100.0  # 数据源小数比例转为百分数值：0.074530 -> 7.453
+
+        # 流通市值不落库；需要时由 close × outstanding_share 计算。
         outstanding_share = safe_float(row.get("outstanding_share"))
-        
-        # 用当天的收盘价乘以流通股本，得出当天的流通市值
-        float_mv = None
-        if outstanding_share is not None and close_p is not None:
-            float_mv = outstanding_share * close_p
+        if outstanding_share is not None:
+            outstanding_share = int(round(outstanding_share))
 
         records.append((
-            ts_code, symbol, trade_date, open_p, high_p, low_p, close_p,
-            change_amount, pct_chg, vol, amount, turnover_rate,
-            outstanding_share, float_mv
+            symbol, trade_date, open_p, high_p, low_p, close_p,
+            vol, turnover_rate, outstanding_share
         ))
 
     if not records:
@@ -182,14 +197,13 @@ def batch_insert_klines(conn: pymysql.connections.Connection, table_name: str, s
 
     # 构建批量插入的 SQL 语句
     sql = f"""
-        INSERT INTO `{table_name}` 
-        (ts_code, symbol, trade_date, open, high, low, close, change_amount, pct_chg, vol, amount, turnover_rate, outstanding_share, float_mv)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE 
+        INSERT INTO `{table_name}`
+        (symbol, trade_date, open, high, low, close, vol, turnover_rate, outstanding_share)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
             open=VALUES(open), high=VALUES(high), low=VALUES(low), close=VALUES(close),
-            change_amount=VALUES(change_amount), pct_chg=VALUES(pct_chg),
-            vol=VALUES(vol), amount=VALUES(amount), turnover_rate=VALUES(turnover_rate),
-            outstanding_share=VALUES(outstanding_share), float_mv=VALUES(float_mv)
+            vol=VALUES(vol), turnover_rate=VALUES(turnover_rate),
+            outstanding_share=VALUES(outstanding_share)
     """
 
     with conn.cursor() as cursor:
@@ -269,4 +283,22 @@ def run(start_date: str = "20230101", duration: int = 500, table_name: str = Non
 if __name__ == "__main__":
     # 调用示例：只拉取从 2023年1月1日 往后的 500 个交易日数据
     # 它将自动建一张纯粹原始数据表: stock_daily_kline_20230101_500
-    run(start_date="20220101", duration=1314)
+    run(start_date="20260101", duration=200)
+    # # 显示所有列
+    # pd.set_option('display.max_columns', None)
+    #
+    # # 显示所有行
+    # pd.set_option('display.max_rows', None)
+    #
+    # # 每列显示宽度不限制（防止内容被截断成 ...）
+    # pd.set_option('display.max_colwidth', None)
+    #
+    # # 显示宽度不限制（防止整体太宽被折叠）
+    # pd.set_option('display.width', None)
+    #
+    #
+    # df = fetch_daily_kline('002580', start_date="20260917", end_date="20260918")
+    # df 数据示例
+    #          date   open   high    low  close      volume       amount  outstanding_share  turnover
+    # 0  2026-09-17  19.01  19.28  18.73  19.02  33712959.0  638796542.0        452338800.0  0.074530
+    # 1  2026-09-18  19.18  19.68  19.10  19.52  41412066.0  806601670.0        452338800.0  0.091551
