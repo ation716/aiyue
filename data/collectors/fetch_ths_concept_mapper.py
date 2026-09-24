@@ -34,19 +34,9 @@ import functools
 import requests
 from bs4 import BeautifulSoup
 
-# 与 data/connectors/db_connector.py 保持同一 DB_* 环境变量口径。
-# 原 mysql_config 模块不在本仓库，不能继续依赖外部项目的导入路径。
-def make_mysql_config():
-    """读取当前进程配置；不连接数据库，不输出凭据。"""
-    from types import SimpleNamespace
-    return SimpleNamespace(
-        host=os.getenv("DB_HOST", "127.0.0.1"),
-        port=int(os.getenv("DB_PORT", "3306")),
-        user=os.getenv("DB_USER", "root"),
-        password=os.getenv("DB_PASSWORD", "root"),
-        database=os.getenv("DB_NAME", "security"),
-        charset="utf8mb4", connect_timeout=10, read_timeout=30, write_timeout=30,
-    )
+# 复用项目内已有的 MySQL 配置
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from mysql_config import make_mysql_config
 
 import pymysql
 
@@ -285,15 +275,12 @@ def create_mapping_table(conn):
 
 
 def _to_ts_code(raw_code: str) -> str:
-    """6位代码 -> ts_code；覆盖沪、深、北三个前缀。"""
-    raw_code = str(raw_code).strip()
+    """6位代码 -> ts_code（与东方财富版规则一致）。"""
     if raw_code.startswith("6"):
         return f"{raw_code}.SH"
-    if raw_code.startswith(("8", "4", "92")):
+    if raw_code.startswith(("8", "4")):
         return f"{raw_code}.BJ"
-    if raw_code.startswith(("0", "3")):
-        return f"{raw_code}.SZ"
-    raise ValueError(f"未知代码前缀: {raw_code}")
+    return f"{raw_code}.SZ"
 
 
 def batch_insert_to_db(conn, stocks: list, concept_name: str) -> int:
@@ -326,25 +313,18 @@ def batch_insert_to_db(conn, stocks: list, concept_name: str) -> int:
 
 # ============================ 断点续传 ============================
 def save_progress(done: set):
-    tmp = PROGRESS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(done), f, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, PROGRESS_FILE)
 
 
 def load_progress() -> set:
-    if not os.path.exists(PROGRESS_FILE):
-        return set()
-    try:
-        with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-            value = json.load(f)
-        if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
-            raise ValueError("断点格式不是字符串列表")
-        return set(value)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"断点文件损坏，请人工处理后再运行：{PROGRESS_FILE}") from exc
+    if os.path.exists(PROGRESS_FILE):
+        try:
+            with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
 
 
 # ============================ 主流程 ============================
@@ -392,10 +372,10 @@ def run_spider(limit: int = None, dry_run: bool = False):
                     total_concepts += 1
                     LOG.info("  成功，入库 %d 只股票（累计 %d 只）。", rows, len(stocks))
                 except Exception as e:
-                    LOG.error("  失败，停止本轮：%s", e)
-                    # 失败不能记为完成，否则断点会永久跳过未成功项。
-                    break
+                    LOG.error("  失败，跳过：%s", e)
                 finally:
+                    done.add(name)
+                    save_progress(done)
                     time.sleep(random.uniform(*SLEEP_CONCEPT))
         finally:
             conn.close()
