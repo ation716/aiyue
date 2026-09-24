@@ -1,0 +1,14 @@
+# Scaffold uses only the Python standard library.
+# Proposed optional dependencies below are NOT installed or version-verified.
+# Enable and pin only when implementing the corresponding adapter.
+# pandas
+# numpy
+# sqlalchemy
+# pymysql
+# psycopg[binary]
+# akshare
+# tushare
+# pyarrow
+# matplotlib
+# pytest
+# jupyterlab

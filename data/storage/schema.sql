@@ -1,0 +1,2 @@
+-- Schema scaffold only. No DDL is executed.
+-- Confirm DB dialect, keys, types and migration policy before implementation.
