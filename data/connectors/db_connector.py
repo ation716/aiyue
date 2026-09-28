@@ -2,7 +2,7 @@
 import re
 import sys
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 import pandas as pd
 import pymysql
@@ -19,6 +19,20 @@ except ModuleNotFoundError as exc:
 
 class DBConnector:
     COLUMNS = "symbol,trade_date,open,high,low,close,vol,turnover_rate,outstanding_share"
+    MARKET_STAT_COLUMNS = (
+        "trade_date",
+        "up_count",
+        "down_count",
+        "rescued_from_down_count",
+        "down_limit_count",
+        "up_limit_count",
+        "up_break_count",
+        "index_amount_total_yi",
+    )
+    INDEX_SYMBOLS = ("000001", "000680", "399006", "399106")
+    MAIN_BOARD_SQL = "(symbol LIKE '60%%' OR symbol LIKE '000%%' OR symbol LIKE '001%%' OR symbol LIKE '002%%' OR symbol LIKE '003%%')"
+    MAIN_BOARD_LIMIT_RATIO = Decimal("0.10")
+    PRICE_TICK = Decimal("0.01")
 
     @property
     def DAILY(self):
@@ -205,6 +219,158 @@ class DBConnector:
             symbols or [],
         )
 
+    @staticmethod
+    def _round_price_tick(value, tick=PRICE_TICK):
+        """按价格最小单位四舍五入；统计口径为当前价格的近似比较。"""
+        if value is None or pd.isna(value):
+            return None
+        value = Decimal(str(value))
+        return (value / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
+
+    def _get_index_daily(self, start_date, end_date):
+        clauses, params = self._dates(start_date, end_date)
+        clauses.append(self._in("symbol", list(self.INDEX_SYMBOLS)))
+        params.extend(self.INDEX_SYMBOLS)
+        return self._query(
+            "SELECT symbol,trade_date,vol,amount FROM "
+            + self.tables.index_daily_kline
+            + self._where(clauses)
+            + " ORDER BY trade_date,symbol",
+            params,
+        )
+
+    def get_main_board_equal_weighted_change(self, start_date=None, end_date=None):
+        """按日期返回主板对象等权平均涨幅。
+
+        涨幅定义为 close / prev_close - 1，先按 symbol 取得前收，再按日期对有效对象
+        做简单算术平均；不按成交量、流通规模或其他权重加权。返回值为小数比例，
+        例如 0.012 表示 1.2%。区间第一天会向前读取数据以取得前收。
+        """
+        if start_date is None or end_date is None:
+            raise ValueError("start_date 和 end_date 均不能为空")
+        self._dates(start_date, end_date)
+        start = date.fromisoformat(start_date) if isinstance(start_date, str) else start_date
+        end = date.fromisoformat(end_date) if isinstance(end_date, str) else end_date
+        previous_day = start - pd.Timedelta(days=7).to_pytimedelta()
+        clauses, params = self._dates(previous_day, end)
+        clauses.append(self.MAIN_BOARD_SQL)
+        daily = self._query(
+            "SELECT symbol,trade_date,close FROM " + self.DAILY
+            + self._where(clauses) + " ORDER BY symbol,trade_date",
+            params,
+        )
+        columns = ["trade_date", "main_board_equal_weighted_change"]
+        if daily.empty:
+            return pd.DataFrame(columns=columns)
+        daily["trade_date"] = pd.to_datetime(daily["trade_date"])
+        daily["prev_close"] = daily.groupby("symbol")["close"].shift(1)
+        daily = daily[
+            (daily["trade_date"].dt.date >= start)
+            & (daily["trade_date"].dt.date <= end)
+            & daily["prev_close"].notna()
+            & daily["close"].notna()
+            & (daily["prev_close"] != 0)
+        ].copy()
+        if daily.empty:
+            return pd.DataFrame(columns=columns)
+        daily["change"] = daily["close"] / daily["prev_close"] - 1
+        return (
+            daily.groupby(daily["trade_date"].dt.date, as_index=False)["change"]
+            .mean()
+            .rename(columns={"trade_date": "trade_date", "change": "main_board_equal_weighted_change"})
+            .loc[:, columns]
+        )
+
+    def get_daily_market_statistics(self, start_date=None, end_date=None):
+        """按日期返回主板价格统计及四个指数成交额汇总。
+
+        上涨/下跌包含上下限对象；上下限和炸板/救回依据当前价格口径近似计算；
+        特殊状态不单独排除。仅汇总指数 amount，按元换算为亿元；任一指数金额缺失则汇总金额为空。
+        """
+        if start_date is None or end_date is None:
+            raise ValueError("start_date 和 end_date 均不能为空")
+        self._dates(start_date, end_date)
+        start = date.fromisoformat(start_date) if isinstance(start_date, str) else start_date
+        end = date.fromisoformat(end_date) if isinstance(end_date, str) else end_date
+        previous_day = start - pd.Timedelta(days=7).to_pytimedelta()
+        daily_clauses, daily_params = self._dates(previous_day, end)
+        daily_clauses.append(self.MAIN_BOARD_SQL)
+        daily = self._query(
+            "SELECT symbol,trade_date,high,low,close FROM "
+            + self.DAILY
+            + self._where(daily_clauses)
+            + " ORDER BY symbol,trade_date",
+            daily_params,
+        )
+        index_daily = self._get_index_daily(start, end)
+        if daily.empty and index_daily.empty:
+            return pd.DataFrame(columns=self.MARKET_STAT_COLUMNS)
+
+        if not daily.empty:
+            daily["trade_date"] = pd.to_datetime(daily["trade_date"])
+            daily["prev_close"] = daily.groupby("symbol")["close"].shift(1)
+            daily = daily[daily["trade_date"].dt.date >= start].copy()
+            daily = daily[daily["prev_close"].notna()].copy()
+            if not daily.empty:
+                daily["up_limit_price"] = daily["prev_close"].map(
+                    lambda value: self._round_price_tick(Decimal(str(value)) * (Decimal("1") + self.MAIN_BOARD_LIMIT_RATIO))
+                )
+                daily["down_limit_price"] = daily["prev_close"].map(
+                    lambda value: self._round_price_tick(Decimal(str(value)) * (Decimal("1") - self.MAIN_BOARD_LIMIT_RATIO))
+                )
+                for column in ("high", "low", "close", "prev_close", "up_limit_price", "down_limit_price"):
+                    daily[column] = pd.to_numeric(daily[column], errors="coerce")
+                daily["is_up"] = daily["close"] > daily["prev_close"]
+                daily["is_down"] = daily["close"] < daily["prev_close"]
+                daily["is_down_limit"] = (daily["low"] <= daily["down_limit_price"]) & (daily["close"] <= daily["down_limit_price"])
+                daily["is_rescued_from_down"] = (daily["low"] <= daily["down_limit_price"]) & (daily["close"] > daily["down_limit_price"])
+                daily["is_up_limit"] = (daily["high"] >= daily["up_limit_price"]) & (daily["close"] >= daily["up_limit_price"])
+                daily["is_up_break"] = (daily["high"] >= daily["up_limit_price"]) & (daily["close"] < daily["up_limit_price"])
+                counts = daily.groupby(daily["trade_date"].dt.date).agg(
+                    up_count=("is_up", "sum"),
+                    down_count=("is_down", "sum"),
+                    rescued_from_down_count=("is_rescued_from_down", "sum"),
+                    down_limit_count=("is_down_limit", "sum"),
+                    up_limit_count=("is_up_limit", "sum"),
+                    up_break_count=("is_up_break", "sum"),
+                ).reset_index(names="trade_date")
+            else:
+                counts = pd.DataFrame(columns=("trade_date", "up_count", "down_count", "rescued_from_down_count", "down_limit_count", "up_limit_count", "up_break_count"))
+        else:
+            counts = pd.DataFrame(columns=("trade_date", "up_count", "down_count", "rescued_from_down_count", "down_limit_count", "up_limit_count", "up_break_count"))
+
+        if not index_daily.empty:
+            index_daily["trade_date"] = pd.to_datetime(index_daily["trade_date"]).dt.date
+            index_daily["amount"] = pd.to_numeric(index_daily["amount"], errors="coerce")
+            index_summary = index_daily.groupby("trade_date", as_index=False).agg(
+                index_amount_total=("amount", lambda series: series.sum(min_count=1)),
+            )
+            index_summary["index_amount_total_yi"] = index_summary["index_amount_total"] / 100000000
+            index_summary = index_summary[["trade_date", "index_amount_total_yi"]]
+        else:
+            index_summary = pd.DataFrame(columns=("trade_date", "index_amount_total_yi"))
+
+        result = counts.merge(index_summary, on="trade_date", how="left")
+        count_columns = [
+            "up_count", "down_count", "rescued_from_down_count",
+            "down_limit_count", "up_limit_count", "up_break_count",
+        ]
+        for column in count_columns:
+            if column not in result:
+                result[column] = 0
+            else:
+                result[column] = result[column].fillna(0)
+        if "index_amount_total_yi" not in result:
+            result["index_amount_total_yi"] = pd.NA
+        result = result[list(self.MARKET_STAT_COLUMNS)].sort_values("trade_date").reset_index(drop=True)
+        count_columns = [
+            "up_count", "down_count", "rescued_from_down_count",
+            "down_limit_count", "up_limit_count", "up_break_count",
+        ]
+        for column in count_columns:
+            result[column] = result[column].astype("Int64")
+        return result
+
     def get_weekly(self, symbols=None, start_date=None, end_date=None):
         """自然周聚合；日线表没有 amount 时不虚构该列。"""
         columns = "symbol,trade_date,open,high,low,close,vol,turnover_rate".split(",")
@@ -242,11 +408,13 @@ if __name__ == "__main__":
 
     # 使用本机默认连接配置，环境变量可覆盖；退出 with 自动关闭连接。
     with DBConnector() as cn:
-        res1 = cn.get_daily("603221", "2026-08-21", "2026-08-24")
+        # res1 = cn.get_daily("603221", "2026-08-21", "2026-08-24")
         # res2 = cn.get_concept_members(concept_test)
-        res3 = cn.get_concept_names()
+        # res3 = cn.get_concept_names()
         # res4 = cn.get_concept_daily(concept_test, start, end)
         # res5 = cn.get_events(event_types, start, end)
         # res6 = cn.get_weekly(symbol_test, start, end)
+        # res7 = cn.get_daily_market_statistics(start_date=start, end_date=end)
+        res7 = cn.get_main_board_equal_weighted_change(start_date=start, end_date=end)
     # 在下面一行打断点，可查看 res1～res6；不打印、不执行对照测试。
     pass

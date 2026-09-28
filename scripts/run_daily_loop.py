@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 STRAT = "daily"
+# PyCharm 右键直接运行时使用这个实验；切换实验只需修改这一行。
+DEFAULT_EXPERIMENT = "E07"
 
 
 def dump(path, value):
@@ -23,15 +25,23 @@ def dump(path, value):
 def configuration(experiment):
     if not re.fullmatch(r"E\d{2,}", experiment):
         raise ValueError("实验编号格式无效")
-    text = (ROOT / "traces/backtest.md").read_text(encoding="utf-8")
-    sections = re.findall(r"^#{2,3} (E\d+)\b[^\n]*\n(.*?)(?=^#{2,3} |\Z)", text, re.M | re.S)
-    selected = [body for number, body in sections if number == experiment]
-    if len(selected) != 1:
-        raise ValueError("档案必须有且仅有一个对应实验节")
-    snapshots = re.findall(r"```json\s*(.*?)\s*```", selected[0], re.S)
-    if len(snapshots) != 1:
-        raise ValueError("实验节必须有且仅有一个配置快照")
-    cfg = json.loads(snapshots[0])
+
+    # 正式运行配置放在 experiments/<EXP_ID>/config.json，便于 PyCharm 直接调试。
+    config_path = ROOT / "experiments" / experiment / "config.json"
+    if config_path.is_file():
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    else:
+        # 兼容尚未迁移的旧实验：从追溯档案读取配置快照。
+        text = (ROOT / "traces/backtest.md").read_text(encoding="utf-8")
+        sections = re.findall(r"^#{2,3} (E\d+)\b[^\n]*\n(.*?)(?=^#{2,3} |\Z)", text, re.M | re.S)
+        selected = [body for number, body in sections if number == experiment]
+        if len(selected) != 1:
+            raise ValueError("实验配置文件不存在，且追溯档案必须有且仅有一个对应实验节")
+        snapshots = re.findall(r"```json\s*(.*?)\s*```", selected[0], re.S)
+        if len(snapshots) != 1:
+            raise ValueError("实验节必须有且仅有一个配置快照")
+        cfg = json.loads(snapshots[0])
+
     if cfg.get("experiment") != experiment or cfg.get("strat") != STRAT:
         raise ValueError("配置与实验编号不一致")
     return cfg
@@ -39,7 +49,7 @@ def configuration(experiment):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--experiment", default="E06")
+    parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
     args = parser.parse_args()
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -121,12 +131,14 @@ def main():
         print(json.dumps({"status": "running", "run_id": run_id, "stage": stage,
                           "rows": len(frame), "days": len(calendar),
                           "symbols": int(frame.ts_code.nunique())}, ensure_ascii=True), flush=True)
-        result = run_daily(frame, calendar, strategy1, cfg)
+        log_path = ROOT / "logs" / f"{STRAT}_{args.experiment}_{run_id}.log"
+        result = run_daily(frame, calendar, strategy1, cfg, log_path=log_path)
         if not result["equity"]:
             raise ValueError("回测未产生任何账户记录")
-        for name in ("trades", "equity", "final"):
+        for name in ("trades", "equity", "order_log", "final"):
             dump(directory / f"{name}.json", result[name])
         stored = save_result_files(result, directory)
+        stored["trade_log"] = str(log_path)
         print(json.dumps({"status": "passed", "run_id": run_id, "trades": len(result["trades"]),
                           "days": len(result["equity"]), "final_total": result["final"]["total"],
                           "stored": stored}, ensure_ascii=True))

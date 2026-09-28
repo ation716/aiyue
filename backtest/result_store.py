@@ -9,6 +9,10 @@ from pathlib import Path
 TRADE_FIELDS = [
     "date", "phase", "side", "symbol", "price", "vol", "quantity", "fee", "order_id", "flags"
 ]
+ORDER_LOG_FIELDS = [
+    "date", "phase", "submitted_orders", "fills", "rejects", "unexecuted_order",
+    "money", "money_in_using"
+]
 EQUITY_FIELDS = [
     "date", "money", "money_in_using", "market_value", "total", "hold_count", "buys", "sells", "hold"
 ]
@@ -28,6 +32,9 @@ def _write_csv(path: Path, rows: list[dict], fields: list[str]) -> None:
                 output["flags"] = json.dumps(output["flags"], ensure_ascii=False)
             if "hold" in output and isinstance(output["hold"], dict):
                 output["hold"] = json.dumps(output["hold"], ensure_ascii=False, sort_keys=True)
+            for field in ("submitted_orders", "fills", "rejects", "unexecuted_order"):
+                if field in output and isinstance(output[field], (list, dict)):
+                    output[field] = json.dumps(output[field], ensure_ascii=False, default=_json_default, sort_keys=True)
             writer.writerow({field: output.get(field, "") for field in fields})
 
 
@@ -43,11 +50,18 @@ def save_result_files(result: dict, directory: str | Path) -> dict[str, str]:
     equity = list(result.get("equity", []))
 
     trade_path = target / "trades.csv"
+    order_log_path = target / "order_log.csv"
+    order_log_json_path = target / "order_log.json"
     equity_path = target / "equity.csv"
     final_path = target / "final.json"
     chart_path = target / "equity_curve.png"
 
+    order_log = list(result.get("order_log", []))
     _write_csv(trade_path, trades, TRADE_FIELDS)
+    _write_csv(order_log_path, order_log, ORDER_LOG_FIELDS)
+    order_log_json_path.write_text(
+        json.dumps(order_log, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8"
+    )
     _write_csv(equity_path, equity, EQUITY_FIELDS)
     final_path.write_text(
         json.dumps(result.get("final"), ensure_ascii=False, indent=2, default=_json_default),
@@ -56,6 +70,8 @@ def save_result_files(result: dict, directory: str | Path) -> dict[str, str]:
     plot_equity(equity, chart_path)
     return {
         "trades_csv": str(trade_path),
+        "order_log_csv": str(order_log_path),
+        "order_log_json": str(order_log_json_path),
         "equity_csv": str(equity_path),
         "final_json": str(final_path),
         "equity_chart": str(chart_path),

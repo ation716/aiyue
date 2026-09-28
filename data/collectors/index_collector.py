@@ -9,6 +9,7 @@ import math
 import os
 import re
 import sys
+import time
 from typing import Any
 
 import pandas as pd
@@ -22,9 +23,10 @@ from mysql_config import MySQLTables, make_mysql_config
 INDEX_TABLE = "index_daily_kline"
 DEFAULT_INDEX = "000001.SH"
 DEFAULT_INDICES = ["000001.SH", "399106.SZ", "399006.SZ", "000680.SH"] # 上证指数 `000001.SH`、科创综指 `000680.SH`、创业板指 `399006.SZ`、深证综指 `399106.SZ`
-DEFAULT_START_DATE = "20220101"
+DEFAULT_START_DATE = "20250101"
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
+# 注意 科创综指是 2025年1月20日 开始创建的，过早会没有数据 暂时找不到科创版数据
 
 def normalize_ts_code(code: str) -> str:
     raw = str(code or "").strip().upper()
@@ -202,20 +204,93 @@ class IndexKlineStore:
         return len(rows)
 
 
+def _fetch_index_source(fetcher, attempts: int = 3, retry_seconds: float = 1.0) -> pd.DataFrame:
+    """带有限重试的外部指数源请求；失败后抛出最后一次错误。"""
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            result = fetcher()
+            if result is not None and not result.empty:
+                return result
+            last_error = RuntimeError("source returned empty data")
+        except Exception as exc:
+            last_error = exc
+        if attempt + 1 < attempts:
+            time.sleep(retry_seconds)
+    if last_error is not None:
+        raise last_error
+    return pd.DataFrame()
+
+
+def _date_chunks(start: dt.date, end: dt.date, days: int = 365):
+    current = start
+    while current <= end:
+        chunk_end = min(current + dt.timedelta(days=days - 1), end)
+        yield current, chunk_end
+        current = chunk_end + dt.timedelta(days=1)
+
+
+def _fetch_index_daily_em(ak, source_symbol: str, start: dt.date, end: dt.date) -> pd.DataFrame:
+    """分段取得 EM 指数日线，避免长区间请求导致响应不完整或被源拒绝。"""
+    frames = []
+    for chunk_start, chunk_end in _date_chunks(start, end):
+        frame = _fetch_index_source(
+            lambda: ak.stock_zh_index_daily_em(
+                symbol=source_symbol,
+                start_date=chunk_start.strftime("%Y%m%d"),
+                end_date=chunk_end.strftime("%Y%m%d"),
+            )
+        )
+        frames.append(frame)
+    if not frames:
+        return pd.DataFrame()
+    result = pd.concat(frames, ignore_index=True)
+    if "date" in result.columns:
+        result = result.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+    return result.reset_index(drop=True)
+
+
 def fetch_index_daily_akshare(index_code: str, start: dt.date, end: dt.date) -> pd.DataFrame:
     try:
         import akshare as ak
     except ImportError:
         return pd.DataFrame()
     code6, _, suffix = index_code.partition(".")
+    source_symbol = f"{suffix.lower()}{code6}"
+    amount_from_source = True
+    source_label = "EM"
     try:
-        df = ak.stock_zh_index_daily(symbol=f"{suffix.lower()}{code6}")
-    except Exception as exc:
-        print(f"WARN: akshare 获取 {index_code} 失败({exc})")
-        return pd.DataFrame()
+        df = _fetch_index_daily_em(ak, source_symbol, start, end)
+    except Exception as em_exc:
+        source_label = "TX"
+        try:
+            df = _fetch_index_source(lambda: ak.stock_zh_index_daily_tx(
+                symbol=source_symbol,
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"),
+            ))
+            # TX 只有 amount 字段；该值实测与 EM 的 volume 对齐，作为成交量使用。
+            if "volume" not in df.columns and "amount" in df.columns:
+                df["volume"] = df["amount"]
+            df["amount"] = None
+            amount_from_source = False
+        except Exception as tx_exc:
+            source_label = "SINA"
+            try:
+                df = _fetch_index_source(lambda: ak.stock_zh_index_daily(symbol=source_symbol))
+                amount_from_source = False
+            except Exception as exc:
+                print(f"WARN: akshare 获取 {index_code} 失败(EM={em_exc}; TX={tx_exc}; Sina={exc})")
+                return pd.DataFrame()
     if df is None or df.empty:
         return pd.DataFrame()
     df["date"] = pd.to_datetime(df["date"])
+    if "volume" not in df.columns and "成交量" in df.columns:
+        df = df.rename(columns={"成交量": "volume", "成交额": "amount"})
+    if "volume" not in df.columns:
+        df["volume"] = None
+    if not amount_from_source or "amount" not in df.columns:
+        df["amount"] = None
     df = df[(df["date"] >= pd.Timestamp(start)) & (df["date"] <= pd.Timestamp(end))].copy()
     if df.empty:
         return pd.DataFrame()
@@ -223,14 +298,15 @@ def fetch_index_daily_akshare(index_code: str, start: dt.date, end: dt.date) -> 
     out = pd.DataFrame({
         "symbol": _normalize_symbol(index_code), "date": df["date"].dt.strftime("%Y-%m-%d"),
         "open": df["open"], "high": df["high"], "low": df["low"],
-        "close": df["close"], "vol": df["volume"], "amount": None,
+        "close": df["close"], "vol": df["volume"], "amount": df["amount"],
     })
+    out.attrs["source"] = source_label
     return out
 
 
 def fetch_index_daily(index_code: str, start: dt.date, end: dt.date) -> pd.DataFrame:
     try:
-        import baostock as bs
+        import baostock as bs  # 包 stock 才有成交额，新浪财经没有
     except ImportError:
         return fetch_index_daily_akshare(index_code, start, end)
 
@@ -265,6 +341,7 @@ def fetch_index_daily(index_code: str, start: dt.date, end: dt.date) -> pd.DataF
         "open": raw["open"], "high": raw["high"], "low": raw["low"],
         "close": raw["close"], "vol": raw["volume"], "amount": raw["amount"],
     })
+    out.attrs["source"] = "BAOSTOCK"
     return out
 
 
@@ -317,6 +394,18 @@ def main(argv: list[str] | None = None) -> int:
         df = fetch_index_daily(index_code, start, end)
         if df.empty:
             print(f"WARN: {index_code} 无数据")
+            ok = False
+            continue
+        if df.attrs.get("source") not in {"EM", "BAOSTOCK"}:
+            print(f"WARN: {index_code} 未取得可靠成交额来源，未写入")
+            ok = False
+            continue
+        if "amount" not in df.columns or df["amount"].isna().any():
+            print(f"WARN: {index_code} 成交额缺失，未写入；请使用提供真实 amount 的数据源")
+            ok = False
+            continue
+        if df["vol"].isna().any():
+            print(f"WARN: {index_code} 成交量缺失，未写入")
             ok = False
             continue
         rows = store.upsert_daily_kline(df)

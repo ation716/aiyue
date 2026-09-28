@@ -11,8 +11,10 @@
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
+import json
+from pathlib import Path
 
 from backtest.broker import DailyBar, money, number
 from backtest.trading import AccountState, TradeContext, execute, settle_day
@@ -29,7 +31,21 @@ def build_bar(row, prev_close, lot_size=LOT) -> DailyBar:
                     rule_status="UNKNOWN")
 
 
-def run_daily(daily, calendar, strategy, config):
+def _append_trade_log(log_handle, message):
+    """Write one human-readable event to the optional .log file."""
+    if log_handle is None:
+        return
+    log_handle.write(message + "\n")
+    log_handle.flush()
+
+
+def _format_orders(orders):
+    if not orders:
+        return "[]"
+    return json.dumps(orders, ensure_ascii=False, default=str, indent=2)
+
+
+def run_daily(daily, calendar, strategy, config, log_path=None):
     """按统一日历逐日轮询。
 
     入参：
@@ -40,8 +56,14 @@ def run_daily(daily, calendar, strategy, config):
     """
     lot_size = int(config["lot_size"])
     account = AccountState(cash=number(config["initial_cash"]))
+    log_handle = None
+    if log_path is not None:
+        log_file = Path(log_path)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = log_file.open("a", encoding="utf-8")
+        _append_trade_log(log_handle, f"[{datetime.now().isoformat(timespec='seconds')}] RUN_START")
     by_day = {d: g for d, g in daily.groupby("trade_date")}
-    closes, trades, equity = {}, [], []
+    closes, trades, equity, order_log = {}, [], [], []
     pending_orders = []          # 由上一交易日收盘信号生成的委托，当日执行
     signal_generated = None
 
@@ -68,9 +90,20 @@ def run_daily(daily, calendar, strategy, config):
         phase_results = []
         for phase in PHASES:
             orders = pending_orders if phase == "OPEN" else []
+            submitted = [dict(order) for order in orders]
             item = execute(orders, phase, context, account, config)
             item["date"] = str(day)
             phase_results.append(item)
+            order_log.append({
+                "date": str(day),
+                "phase": phase,
+                "submitted_orders": submitted,
+                "fills": list(item["fills"]),
+                "rejects": list(item["rejects"]),
+                "unexecuted_order": item["account"]["unexecuted_order"],
+                "money": item["account"]["money"],
+                "money_in_using": item["account"]["money_in_using"],
+            })
         settle_day(account)
         pending_orders = []
 
@@ -84,12 +117,22 @@ def run_daily(daily, calendar, strategy, config):
             "total": str(money(account.cash_total + market_value)),
             "hold_count": len(account.hold), "buys": 0, "sells": 0,
         }
+        day_fills = []
         for item in phase_results:
             account_row["buys"] += sum(1 for f in item["fills"] if f["side"] == "buy")
             account_row["sells"] += sum(1 for f in item["fills"] if f["side"] == "sell")
             for fill in item["fills"]:
-                trades.append(dict(fill, date=str(day)))
+                fill_row = dict(fill, date=str(day))
+                trades.append(fill_row)
+                day_fills.append(fill_row)
         equity.append(account_row)
+        # 按需求：尾盘结束后，当天有成交时才写成交明细。
+        if day_fills:
+            _append_trade_log(
+                log_handle,
+                f"[{datetime.now().isoformat(timespec='seconds')}] TRADE_FILLED "
+                f"trade_date={day} report_point=AFTER_CLOSE\n{_format_orders(day_fills)}",
+            )
 
         if index + 1 >= len(calendar):
             break
@@ -102,17 +145,30 @@ def run_daily(daily, calendar, strategy, config):
         next_day = calendar[index + 1]
         next_rows = by_day.get(next_day)
         valid = set() if next_rows is None else set(next_rows.ts_code)
+        planned_orders = []
         if buy:
             plan, _info = allocation(buy, snapshot, config)
             for symbol, detail in plan.items():
                 if symbol in valid:
-                    pending_orders.append({"order_id": f"{day:%Y%m%d}-{symbol}-B", "symbol": symbol,
+                    planned_orders.append({"order_id": f"{day:%Y%m%d}-{symbol}-B", "symbol": symbol,
                                            "side": "buy", "price": detail["buy"], "vol": detail["vol"],
                                            "generated_date": day, "entry_index": index + 1})
         for symbol, detail in sell.items():
             if symbol in valid:
-                pending_orders.append({"order_id": f"{day:%Y%m%d}-{symbol}-S", "symbol": symbol,
+                planned_orders.append({"order_id": f"{day:%Y%m%d}-{symbol}-S", "symbol": symbol,
                                        "side": "sell", "price": detail["sell"], "vol": detail["vol"],
                                        "generated_date": day})
+        pending_orders.extend(planned_orders)
+        if planned_orders:
+            _append_trade_log(
+                log_handle,
+                f"[{datetime.now().isoformat(timespec='seconds')}] ORDER_PLANNED "
+                f"trade_date={day} execute_date={next_day}\n{_format_orders(planned_orders)}",
+            )
 
-    return {"trades": trades, "equity": equity, "final": equity[-1] if equity else None}
+    if log_handle is not None:
+        _append_trade_log(log_handle, f"[{datetime.now().isoformat(timespec='seconds')}] RUN_END")
+        log_handle.close()
+
+    return {"trades": trades, "equity": equity, "order_log": order_log,
+            "final": equity[-1] if equity else None}
