@@ -8,6 +8,7 @@ from pathlib import Path
 import platform
 import re
 import sys
+import traceback
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -41,41 +42,57 @@ def main():
     parser.add_argument("--experiment", default="E06")
     args = parser.parse_args()
 
-    import numpy as np
-    import pandas as pd
-
-    from data.connectors.db_connector import DBConnector
-    from scoring.strategies import strategy1
-    from backtest.daily_loop import run_daily
-    from backtest.result_store import save_result_files
-
-    cfg = configuration(args.experiment)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     directory = ROOT / "results" / STRAT / args.experiment / run_id
     directory.mkdir(parents=True, exist_ok=False)
-    dump(directory / "config.json", cfg)
-
+    stage = "startup"
     metadata = {"run_id": run_id, "created_at": datetime.now().isoformat(),
-                "python_version": platform.python_version(), "pandas_version": pd.__version__,
-                "numpy_version": np.__version__, "daily_table": cfg["daily_table"],
-                "config_sha256": hashlib.sha256(
-                    json.dumps(cfg, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
-                "assumption": "近似演示模式；日K代理成交，不是净真实可实现回报"}
-    stage = "static_validation"
+                "experiment": args.experiment, "root": str(ROOT)}
+    print(json.dumps({"status": "started", "run_id": run_id, "stage": stage,
+                      "directory": str(directory)}, ensure_ascii=True), flush=True)
     try:
+        stage = "imports"
+        import numpy as np
+        import pandas as pd
+
+        from data.connectors.db_connector import DBConnector
+        from scoring.strategies import strategy1
+        from backtest.daily_loop import run_daily
+        from backtest.result_store import save_result_files
+
+        stage = "configuration"
+        cfg = configuration(args.experiment)
+        dump(directory / "config.json", cfg)
+        metadata.update({"python_version": platform.python_version(),
+                         "pandas_version": pd.__version__, "numpy_version": np.__version__,
+                         "daily_table": cfg["daily_table"],
+                         "config_sha256": hashlib.sha256(
+                             json.dumps(cfg, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
+                         "assumption": "近似演示模式；日K代理成交，不是净真实可实现回报"})
+        dump(directory / "metadata.json", metadata)
+        print(json.dumps({"status": "started", "run_id": run_id, "stage": stage,
+                          "directory": str(directory)}, ensure_ascii=True), flush=True)
         for name in ["backtest/broker.py", "backtest/trading.py", "backtest/daily_loop.py",
                      "portfolio/allocate.py", "scoring/strategies/strategy1/choose.py"]:
             ast.parse((ROOT / name).read_text(encoding="utf-8"), filename=name)
 
         frame = None
         stage = "connect"
-        with DBConnector() as db:
+        print(json.dumps({"status": "running", "run_id": run_id, "stage": stage}, ensure_ascii=True), flush=True)
+        # 实验节指定逻辑日线表；连接实例仍由 MYSQL_* 环境变量提供。
+        with DBConnector(tables={"daily": cfg["daily_table"]}) as db:
             stage = "daily"
+            print(json.dumps({"status": "running", "run_id": run_id, "stage": stage,
+                              "table": db.tables.daily, "start": cfg["start"], "end": cfg["end"]},
+                             ensure_ascii=True), flush=True)
             frame = db.get_daily(start_date=cfg["start"], end_date=cfg["end"])
         if frame is None or frame.empty:
             raise ValueError("未取得真实日线，停止而不补造")
+        print(json.dumps({"status": "running", "run_id": run_id, "stage": stage,
+                          "rows": len(frame)}, ensure_ascii=True), flush=True)
 
         stage = "data_validation"
+        print(json.dumps({"status": "running", "run_id": run_id, "stage": stage}, ensure_ascii=True), flush=True)
         frame = frame.rename(columns={"symbol": "ts_code"})
         frame["ts_code"] = frame.ts_code.astype(str).str.zfill(6)
         for column in ["open", "high", "low", "close", "vol", "turnover_rate", "outstanding_share"]:
@@ -101,6 +118,9 @@ def main():
         dump(directory / "metadata.json", metadata)
 
         stage = "daily_loop"
+        print(json.dumps({"status": "running", "run_id": run_id, "stage": stage,
+                          "rows": len(frame), "days": len(calendar),
+                          "symbols": int(frame.ts_code.nunique())}, ensure_ascii=True), flush=True)
         result = run_daily(frame, calendar, strategy1, cfg)
         if not result["equity"]:
             raise ValueError("回测未产生任何账户记录")
@@ -111,11 +131,16 @@ def main():
                           "days": len(result["equity"]), "final_total": result["final"]["total"],
                           "stored": stored}, ensure_ascii=True))
     except Exception as error:
+        metadata.update({"failed_stage": stage, "error_type": type(error).__name__,
+                         "error_detail": str(error)})
         dump(directory / "metadata.json", metadata)
         dump(directory / "error.json", {"status": "blocked", "stage": stage, "error_type": type(error).__name__,
+                                        "error_detail": str(error),
+                                        "traceback": traceback.format_exc(),
                                         "message": "真实读取或验证失败；未生成成功结果，无自动重试、无替代数据。"})
         print(json.dumps({"status": "blocked", "run_id": run_id, "stage": stage,
-                          "error_type": type(error).__name__}, ensure_ascii=True))
+                          "error_type": type(error).__name__, "error_detail": str(error),
+                          "directory": str(directory)}, ensure_ascii=True), flush=True)
         raise SystemExit(1)
 
 

@@ -112,3 +112,47 @@
 - **状态**：已闭环
 - **结论**：真实只读数据运行通过，177 个交易日生成 177 行 `equity.csv`、12 行 `trades.csv`，PNG 图像文件大小 193131 字节；期末总资产 206556.28，与 E05 原始 JSON 结果一致，说明新增存储和绘图层没有改变回测计算。CSV 已保存交易日期、阶段、方向、symbol、成交价、手数、股数、费用、委托编号和撮合标记；权益 CSV 已保存可用现金、使用中现金、估值、总资产、持有数量、每日买卖数和持仓快照。绘图使用 Matplotlib Agg 后端，包含总资产/现金/估值、累计变化和回撤三部分。该图只用于结果检查，不代表可实现的实际回报。
 - **后续动作**：如果后续需要跨多次运行比较，可再增加基准曲线、交易标记和按 symbol 的单独图层；本次不改变 E05 策略参数。
+
+### E07 · 2026-09-28 · 服务器大数据源重跑流程准备
+
+- **假设**：代码与实验配置提交后，在服务器设置独立的只读数据库连接，通过同一入口读取服务器上的更大日线表并重新生成结果；本地小库结果不作为服务器结果输入。
+- **唯一变更点**：不改变策略、配仓、撮合和绘图逻辑；仅增加服务器环境配置模板、依赖声明和数据库配置加载能力，并让入口真正使用实验配置的 `daily_table`。
+- **完整配置快照**：
+```json
+{
+  "strat": "daily", "experiment": "E07",
+  "start": "2026-01-05", "end": "2026-09-23",
+  "daily_table": "stock_daily_kline_20260101_200",
+  "data_mode": "real_db_only",
+  "calendar": "主板日线区间日期并集（过滤后生成）",
+  "prefixes": ["000", "001", "002", "003", "600", "601", "603", "605"],
+  "initial_cash": "200000", "lot_size": 100,
+  "max_positions": 8, "min_cash": "3000", "budget_rate": "1",
+  "warmup_days": 61, "window": 60, "median_ratio": 0.9,
+  "change_days": 5, "change_min": -0.05,
+  "size_field": "float_mv", "size_min": 2000000000,
+  "buy_ratio": 0.995, "take_profit": 0.10, "stop_loss": 0.10, "hold_days": 10,
+  "fee_rate": "0.0001", "min_fee": "5", "slippage": "0",
+  "phases": ["OPEN", "INTRADAY", "CLOSE"],
+  "approximate_mode": true,
+  "result_storage": ["trades.csv", "equity.csv", "final.json", "equity_curve.png"],
+  "plot_library": "matplotlib",
+  "limit_ratio": "不适用：撮合层内联 1.10/0.90 近似限制价，未读取该键",
+  "price_tick": "不适用：撮合层固定 ROUND_HALF_UP 两位，未读取该键",
+  "size_semantics": "close×outstanding_share 的流通市值估算，非总市值",
+  "st_policy": "未按名称排除；数据源无可靠历史状态，结果须标注该局限",
+  "strategy_module": "scoring.strategies.strategy1",
+  "allocation_module": "portfolio.allocate.allocation",
+  "server_db": "由服务器 .env 提供，不写入档案"
+}
+```
+服务器侧连接差异为 `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` 和实际日线表名，由服务器未提交的 `.env` 提供；密码不写入本档案。
+- **数据源**：服务器端真实只读数据库；数据表名由 E07 的 `daily_table` 指定，数据库连接由服务器 `.env` 提供。
+- **代码版本**：待提交。
+- **运行环境**：服务器项目虚拟环境；依赖由 `requirements.txt` 安装。
+- **运行命令**：`.venv/bin/python scripts/run_daily_loop.py --experiment E07`（服务器按实际解释器路径调整）。
+- **执行者**：待服务器运行后登记。
+- **产出文件**：服务器运行后回填；`results/` 被 Git 忽略，不通过代码提交传输。
+- **状态**：待运行
+- **结论**：本地已完成入口配置加载和真实只读查询验证；服务器大库尚未运行，不能提前推断服务器结果。
+- **后续动作**：提交代码和 E07 档案；服务器拉取后复制 `.env.example` 为 `.env`，填写服务器数据库连接，安装依赖，先做字段/日期/行数预检，再执行 E07；运行后回填实际产出路径和结果。
