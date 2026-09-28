@@ -9,6 +9,6 @@
 # akshare
 # tushare
 # pyarrow
-# matplotlib
+matplotlib>=3.11,<4
 # pytest
 # jupyterlab

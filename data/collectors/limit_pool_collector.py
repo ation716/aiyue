@@ -1,43 +1,266 @@
-"""
-本文件负责每日采集 A 股涨停/跌停/炸板数据（含行业信息）并入库 + 分行业统计。
-
-数据源：akshare 东财三个池（自带「所属行业」字段）：
-- 涨停池 ak.stock_zt_pool_em(date)
-- 跌停池 ak.stock_zt_pool_dtgc_em(date)
-- 炸板池 ak.stock_zt_pool_zbgc_em(date)
-
-⚠️ 关键约束：三个接口都只能回溯最近约 30 个交易日，无法回补历史。因此本脚本应
-每日运行一次做增量积累；首次运行可用 BACKFILL_DAYS 尝试回填最近 N 个交易日。
-
-用法：改下面「采集配置」区，然后在 PyCharm 里直接 Run 本文件即可（无需命令行参数）。
-"""
+"""Collect daily pool data and rebuild the industry aggregation."""
 
 from __future__ import annotations
 
 import datetime as dt
+import math
 import os
+import re
 import sys
+import time
+from typing import Any
 
 import pandas as pd
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
-for _path in (CURRENT_DIR, ROOT_DIR):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
+if CURRENT_DIR not in sys.path:
+    sys.path.insert(0, CURRENT_DIR)
 
-from limit_pool_store import LimitPoolStore, normalize_ts_code
-
-# ==================== 采集配置（直接改这里，PyCharm Run 即可） ====================
-TRADE_DATE = None               # 采集结束日：None=今天；或 "2026-09-14"
-BACKFILL_TRADING_DAYS = 30      # 批量回填最近 N 个交易日（>0 时从 TRADE_DATE 往前补 N 个交易日；受数据源 ~30 天约束）
-BACKFILL_DAYS = 0               # 兼容旧逻辑：按自然日回填（0=关闭）。BACKFILL_TRADING_DAYS 优先于本项
-SKIP_EXISTING = True            # 跳过数据库里已存在的日期，做幂等缺口补齐（重跑不重复拉取）
-SLEEP_SECONDS = 0.5             # 每次接口调用后的等待秒数（避免触发限频）
-# ==================================================================================
+from mysql_config import MySQLTables, make_mysql_config
 
 
-def _parse_date(value) -> dt.date:
+POOL_TYPES = {"zt": "涨停", "dt": "跌停", "zb": "炸板"}
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+TRADE_DATE = None
+BACKFILL_TRADING_DAYS = 30
+BACKFILL_DAYS = 0
+SKIP_EXISTING = True
+SLEEP_SECONDS = 0.5
+
+
+def normalize_ts_code(code: str) -> str:
+    raw = str(code or "").strip().upper()
+    if "." in raw:
+        code6, suffix = raw.split(".", 1)
+        return f"{code6.zfill(6)}.{suffix}"
+    code6 = raw.zfill(6)
+    if code6.startswith(("60", "68", "90")):
+        return f"{code6}.SH"
+    if code6.startswith(("43", "83", "87", "88")):
+        return f"{code6}.BJ"
+    return f"{code6}.SZ"
+
+
+def _require_identifier(value: str, label: str) -> str:
+    if not value or not _IDENTIFIER_RE.fullmatch(value):
+        raise ValueError(f"Invalid MySQL {label}: {value!r}")
+    return value
+
+
+def _clean_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    text = str(value).replace(",", "").replace("%", "").strip()
+    if text in ("", "None", "nan", "NaN", "-"):
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _clean_int(value: Any) -> int | None:
+    num = _clean_number(value)
+    return int(num) if num is not None else None
+
+
+def _clean_str(value: Any, max_len: int) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    return text[:max_len] if text and text.lower() not in ("nan", "none") else None
+
+
+def _clean_time(value: Any) -> str | None:
+    text = str(value).strip().replace(":", "") if value is not None else ""
+    return text[:8] if text and text.lower() not in ("nan", "none") else None
+
+
+def _import_pymysql():
+    try:
+        import pymysql
+    except ImportError as exc:
+        raise RuntimeError("PyMySQL is not installed") from exc
+    return pymysql
+
+
+class LimitPoolStore:
+    def __init__(self, config=None, tables: MySQLTables | None = None):
+        self.config = config or make_mysql_config()
+        self.tables = tables or MySQLTables.from_env()
+        self.pool_table = _require_identifier(self.tables.limit_pool_daily, "pool table")
+        self.stat_table = _require_identifier(self.tables.industry_pool_stat, "industry stat table")
+
+    @property
+    def database(self) -> str:
+        return _require_identifier(self.config.database, "database")
+
+    def connect(self, database: str | None = None):
+        pymysql = _import_pymysql()
+        return pymysql.connect(
+            host=self.config.host, port=self.config.port, user=self.config.user,
+            password=self.config.password, database=database,
+            charset=self.config.charset, connect_timeout=self.config.connect_timeout,
+            autocommit=False, cursorclass=pymysql.cursors.DictCursor,
+        )
+
+    def ensure_schema(self) -> None:
+        database = self.database
+        server_conn = self.connect(database=None)
+        try:
+            with server_conn.cursor() as cursor:
+                cursor.execute(
+                    f"CREATE DATABASE IF NOT EXISTS `{database}` "
+                    "DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci"
+                )
+            server_conn.commit()
+        finally:
+            server_conn.close()
+
+        conn = self.connect(database=database)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""CREATE TABLE IF NOT EXISTS `{self.pool_table}` (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        pool_type VARCHAR(4) NOT NULL,
+                        trade_date DATE NOT NULL,
+                        ts_code VARCHAR(16) NOT NULL,
+                        name VARCHAR(32) NULL,
+                        industry VARCHAR(64) NULL,
+                        pct_chg DECIMAL(10,4) NULL,
+                        close DECIMAL(12,4) NULL,
+                        limit_price DECIMAL(12,4) NULL,
+                        turn DECIMAL(10,4) NULL,
+                        amount DECIMAL(20,2) NULL,
+                        float_mv DECIMAL(20,2) NULL,
+                        total_mv DECIMAL(20,2) NULL,
+                        limit_up_cnt INT NULL,
+                        break_cnt INT NULL,
+                        first_limit_time VARCHAR(8) NULL,
+                        last_limit_time VARCHAR(8) NULL,
+                        seal_money DECIMAL(20,2) NULL,
+                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                            ON UPDATE CURRENT_TIMESTAMP,
+                        UNIQUE KEY uk_type_date_code (pool_type, trade_date, ts_code),
+                        KEY idx_trade_date (trade_date),
+                        KEY idx_industry (industry)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+                cursor.execute(
+                    f"""CREATE TABLE IF NOT EXISTS `{self.stat_table}` (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        trade_date DATE NOT NULL,
+                        industry VARCHAR(64) NOT NULL,
+                        zt_cnt INT NOT NULL DEFAULT 0,
+                        dt_cnt INT NOT NULL DEFAULT 0,
+                        zb_cnt INT NOT NULL DEFAULT 0,
+                        zt_codes TEXT NULL,
+                        dt_codes TEXT NULL,
+                        zb_codes TEXT NULL,
+                        strength INT NOT NULL DEFAULT 0,
+                        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                            ON UPDATE CURRENT_TIMESTAMP,
+                        UNIQUE KEY uk_date_industry (trade_date, industry),
+                        KEY idx_trade_date (trade_date)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def upsert_pool(self, rows: list[dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        columns = (
+            "pool_type", "trade_date", "ts_code", "name", "industry", "pct_chg",
+            "close", "limit_price", "turn", "amount", "float_mv", "total_mv",
+            "limit_up_cnt", "break_cnt", "first_limit_time", "last_limit_time",
+            "seal_money",
+        )
+        placeholders = ", ".join(["%s"] * len(columns))
+        updates = ", ".join(f"{c}=VALUES({c})" for c in columns[3:])
+        sql = (
+            f"INSERT INTO `{self.pool_table}` ({', '.join(columns)}) VALUES ({placeholders}) "
+            f"ON DUPLICATE KEY UPDATE {updates}, updated_at=CURRENT_TIMESTAMP"
+        )
+        values = [tuple(row.get(c) for c in columns) for row in rows]
+        conn = self.connect(database=self.database)
+        try:
+            with conn.cursor() as cursor:
+                cursor.executemany(sql, values)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return len(values)
+
+    def get_existing_dates(self) -> set[dt.date]:
+        conn = self.connect(database=self.database)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT DISTINCT trade_date FROM `{self.pool_table}`")
+                rows = cursor.fetchall()
+        finally:
+            conn.close()
+        return {row["trade_date"] for row in rows}
+
+    def rebuild_industry_stat(self, trade_date: dt.date) -> dict[str, int]:
+        conn = self.connect(database=self.database)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT industry, pool_type, ts_code FROM `{self.pool_table}` "
+                    "WHERE trade_date = %s AND industry IS NOT NULL",
+                    (trade_date,),
+                )
+                rows = cursor.fetchall()
+        finally:
+            conn.close()
+
+        stat: dict[str, dict[str, list[str]]] = {}
+        for row in rows:
+            industry = str(row["industry"])
+            pool_type = str(row["pool_type"])
+            bucket = stat.setdefault(industry, {"zt": [], "dt": [], "zb": []})
+            if pool_type in bucket:
+                bucket[pool_type].append(str(row["ts_code"]))
+        values = []
+        for industry, bucket in stat.items():
+            codes = {key: ",".join(sorted(bucket[key])) or None for key in ("zt", "dt", "zb")}
+            strength = 2 * len(bucket["zt"]) + len(bucket["zb"]) - 2 * len(bucket["dt"])
+            values.append((
+                trade_date, industry, len(bucket["zt"]), len(bucket["dt"]),
+                len(bucket["zb"]), codes["zt"], codes["dt"], codes["zb"], strength,
+            ))
+
+        conn = self.connect(database=self.database)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(f"DELETE FROM `{self.stat_table}` WHERE trade_date = %s", (trade_date,))
+                if values:
+                    cursor.executemany(
+                        f"INSERT INTO `{self.stat_table}` "
+                        "(trade_date, industry, zt_cnt, dt_cnt, zb_cnt, zt_codes, dt_codes, zb_codes, strength) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        values,
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return {"industry_rows": len(values), "total_stocks": len(rows)}
+
+
+def _parse_date(value) -> dt.date | None:
     if value is None:
         return None
     if isinstance(value, dt.date):
@@ -47,117 +270,51 @@ def _parse_date(value) -> dt.date:
 
 
 def _recent_trading_days(end: dt.date, n: int) -> list[dt.date]:
-    """
-    返回 end 及之前的最近 n 个交易日（含 end，若 end 非交易日则取之前最近的一个）。
-
-    优先用 akshare 官方交易日历；若日历获取失败，退回「周一至周五」估算。
-    """
     import akshare as ak
-
     try:
         cal = ak.tool_trade_date_hist_sina()
-        raw = cal["trade_date"].tolist()
-        dates: list[dt.date] = []
-        for d in raw:
-            if isinstance(d, dt.datetime):
-                dates.append(d.date())
-            elif isinstance(d, dt.date):
-                dates.append(d)
-            else:
-                dates.append(_parse_date(d))
-        dates = sorted(set(dates))
-        candidates = [d for d in dates if d <= end]
-        return candidates[-n:]
+        dates = sorted({_parse_date(value) for value in cal["trade_date"].tolist()})
+        return [value for value in dates if value <= end][-n:]
     except Exception as exc:
-        print(f"WARN: 交易日历获取失败({exc})，退回工作日(周一~周五)估算")
-        out: list[dt.date] = []
+        print(f"WARN: 交易日历获取失败({exc})，退回工作日估算")
+        out = []
         cur = end
         while len(out) < n:
-            if cur.weekday() < 5:  # 0=周一 ... 4=周五
+            if cur.weekday() < 5:
                 out.append(cur)
             cur -= dt.timedelta(days=1)
         return list(reversed(out))
 
 
 def _to_rows(df: pd.DataFrame, pool_type: str, trade_date: dt.date) -> list[dict]:
-    """
-    把 akshare 返回的 DataFrame 清洗成统一的行字典列表。
-
-    三个池字段不完全一致，这里统一映射；没有的字段填 None。
-    """
     if df is None or df.empty:
         return []
-    rows: list[dict] = []
-    for _, r in df.iterrows():
-        code = str(r.get("代码", "")).strip()
+    rows = []
+    for _, item in df.iterrows():
+        code = str(item.get("代码", "")).strip()
         if not code:
             continue
-        ts_code = normalize_ts_code(code)
         rows.append({
-            "pool_type": pool_type,
-            "trade_date": trade_date,
-            "ts_code": ts_code,
-            "name": _clean(r.get("名称")),
-            "industry": _clean(r.get("所属行业")),
-            "pct_chg": _num(r.get("涨跌幅")),
-            "close": _num(r.get("最新价")),
-            "limit_price": _num(r.get("涨停价")),
-            "turn": _num(r.get("换手率")),
-            "amount": _num(r.get("成交额")),
-            "float_mv": _num(r.get("流通市值")),
-            "total_mv": _num(r.get("总市值")),
-            "limit_up_cnt": _int(r.get("连板数", r.get("连续跌停"))),
-            "break_cnt": _int(r.get("炸板次数", r.get("开板次数"))),
-            "first_limit_time": _time(r.get("首次封板时间")),
-            "last_limit_time": _time(r.get("最后封板时间")),
-            "seal_money": _num(r.get("封板资金", r.get("封单资金"))),
+            "pool_type": pool_type, "trade_date": trade_date,
+            "ts_code": normalize_ts_code(code), "name": _clean_str(item.get("名称"), 32),
+            "industry": _clean_str(item.get("所属行业"), 64),
+            "pct_chg": _clean_number(item.get("涨跌幅")), "close": _clean_number(item.get("最新价")),
+            "limit_price": _clean_number(item.get("涨停价")), "turn": _clean_number(item.get("换手率")),
+            "amount": _clean_number(item.get("成交额")), "float_mv": _clean_number(item.get("流通市值")),
+            "total_mv": _clean_number(item.get("总市值")),
+            "limit_up_cnt": _clean_int(item.get("连板数", item.get("连续跌停"))),
+            "break_cnt": _clean_int(item.get("炸板次数", item.get("开板次数"))),
+            "first_limit_time": _clean_time(item.get("首次封板时间")),
+            "last_limit_time": _clean_time(item.get("最后封板时间")),
+            "seal_money": _clean_number(item.get("封板资金", item.get("封单资金"))),
         })
     return rows
 
 
-def _num(v):
-    if v is None:
-        return None
-    try:
-        import math
-        if isinstance(v, float) and math.isnan(v):
-            return None
-    except Exception:
-        pass
-    s = str(v).replace(",", "").replace("%", "").strip()
-    if s in ("", "None", "nan", "NaN", "-"):
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-def _int(v):
-    n = _num(v)
-    return int(n) if n is not None else None
-
-
-def _clean(v):
-    if v is None:
-        return None
-    s = str(v).strip()
-    return s[:64] if s and s.lower() not in ("nan", "none") else None
-
-
-def _time(v):
-    if v is None:
-        return None
-    s = str(v).strip().replace(":", "")
-    return s[:8] if s and s.lower() not in ("nan", "none") else None
-
-
 def fetch_all_pools(trade_date: dt.date) -> dict[str, list[dict]]:
-    """拉取某日的涨停/跌停/炸板三池，返回 {pool_type: [rows]}。"""
     import akshare as ak
     date_str = trade_date.strftime("%Y%m%d")
-    result: dict[str, list[dict]] = {}
-
+    result = {}
     fetchers = {
         "zt": ("涨停池", lambda: ak.stock_zt_pool_em(date=date_str)),
         "dt": ("跌停池", lambda: ak.stock_zt_pool_dtgc_em(date=date_str)),
@@ -165,36 +322,23 @@ def fetch_all_pools(trade_date: dt.date) -> dict[str, list[dict]]:
     }
     for pool_type, (label, fetch) in fetchers.items():
         try:
-            df = fetch()
-            rows = _to_rows(df, pool_type, trade_date)
+            rows = _to_rows(fetch(), pool_type, trade_date)
             result[pool_type] = rows
-            print(f"{label} {date_str}: {len(rows)} 只")
+            print(f"{label} {date_str}: {len(rows)} 条")
         except Exception as exc:
-            msg = str(exc)
-            if "只能获取最近" in msg or "30" in msg:
-                print(f"WARN: {label} {date_str} 超出回溯范围（{msg}）")
-            else:
-                print(f"WARN: {label} {date_str} 获取失败({exc})")
+            print(f"WARN: {label} {date_str} 获取失败({exc})")
             result[pool_type] = []
-        import time
         time.sleep(SLEEP_SECONDS)
     return result
 
 
 def collect_one_day(store: LimitPoolStore, trade_date: dt.date) -> dict:
-    """采集单日数据并入库 + 统计。"""
     pools = fetch_all_pools(trade_date)
     all_rows = pools["zt"] + pools["dt"] + pools["zb"]
     written = store.upsert_pool(all_rows) if all_rows else 0
     stat = store.rebuild_industry_stat(trade_date) if all_rows else {"industry_rows": 0, "total_stocks": 0}
-    return {
-        "date": trade_date,
-        "zt": len(pools["zt"]),
-        "dt": len(pools["dt"]),
-        "zb": len(pools["zb"]),
-        "written": written,
-        **stat,
-    }
+    return {"date": trade_date, "zt": len(pools["zt"]), "dt": len(pools["dt"]),
+            "zb": len(pools["zb"]), "written": written, **stat}
 
 
 def main() -> int:
@@ -204,32 +348,24 @@ def main() -> int:
     except Exception as exc:
         print(f"ERROR: 建表失败 {exc}")
         return 1
-
     end = _parse_date(TRADE_DATE) or dt.date.today()
-
-    # 1) 决定需要采集的日期范围
     if BACKFILL_TRADING_DAYS > 0:
         dates = _recent_trading_days(end, BACKFILL_TRADING_DAYS)
     elif BACKFILL_DAYS > 0:
-        # 兼容旧逻辑：按自然日回溯
         dates = sorted({end - dt.timedelta(days=i) for i in range(BACKFILL_DAYS)})
     else:
         dates = [end]
-
-    # 2) 幂等缺口补齐：跳过库里已有的日期
     if SKIP_EXISTING and dates:
         existing = store.get_existing_dates()
-        missing = [d for d in dates if d not in existing]
+        missing = [value for value in dates if value not in existing]
         print(f"回补范围 {len(dates)} 天，已存在 {len(dates) - len(missing)} 天，待补 {len(missing)} 天")
         dates = missing
-
-    print(f"开始采集涨停/跌停/炸板数据，共 {len(dates)} 个日期")
+    print(f"开始采集三类池数据，共 {len(dates)} 个日期")
     for trade_date in dates:
         print(f"\n===== {trade_date} =====")
         result = collect_one_day(store, trade_date)
         print(f"写入 {result['written']} 行，行业统计 {result['industry_rows']} 个行业"
-              f"（涨停{result['zt']}/跌停{result['dt']}/炸板{result['zb']}）")
-
+              f"（zt{result['zt']}/dt{result['dt']}/zb{result['zb']}）")
     print("\n完成")
     return 0
 

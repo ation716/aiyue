@@ -192,66 +192,6 @@ class ChipDistributionAnalyzer:
         df = self.pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
         return df
 
-    def get_all_pec(self, ts_code, start_date, end_date):
-        """
-        获取个股详细筹码分布（每个价位的持仓占比）。有积分限制，推荐使用 get_big_fund
-
-        参数示例:
-        ts_code = "600000.SH"
-        start_date = "20240101"
-        end_date = "20240131"
-
-        返回值示例:
-        返回 `pd.DataFrame` 或标准化后的结构化对象。
-        """
-        ts_code = ts_code if len(ts_code) > 6 else self.normal_ts_code(ts_code)
-        df = self.pro.cyq_chips(ts_code=ts_code, start_date=start_date, end_date=end_date)
-        return df
-
-    def get_stock_chip_distribution(self, ts_code, start_date, end_date):
-        """
-        获取个股筹码分布关键指标（成本分位、获利盘等）。有积分限制，推荐使用 get_big_fund
-
-        参数示例:
-        ts_code = "600000.SH"
-        start_date = "20240101"
-        end_date = "20240131"
-
-        返回值示例:
-        返回 `pd.DataFrame` 或标准化后的结构化对象。
-        """
-        ts_code = ts_code if len(ts_code) > 6 else self.normal_ts_code(ts_code)
-        df = self.pro.cyq_perf(ts_code=ts_code, start_date=start_date, end_date=end_date)
-        return df
-
-    def get_stock_chip_akshare(self, ts_code, qfq=""):
-        """
-        通过 akshare 获取个股筹码分布数据。
-
-        参数示例:
-        ts_code = "600000.SH"
-        qfq = ""
-
-        返回值示例:
-        返回 `pd.DataFrame` 或标准化后的结构化对象。
-        """
-        return ak.stock_cyq_em(symbol=ts_code, adjust=qfq)
-
-    def get_stock_chip_distribute_detail(self, ts_code, start_date, end_date):
-        """
-        获取详细筹码分布（每个价位的持仓占比，与 get_all_pec 相同接口）。
-
-        参数示例:
-        ts_code = "600000.SH"
-        start_date = "20240101"
-        end_date = "20240131"
-
-        返回值示例:
-        返回 `pd.DataFrame` 或标准化后的结构化对象。
-        """
-        ts_code = ts_code if len(ts_code) > 6 else self.normal_ts_code(ts_code)
-        df = self.pro.cyq_chips(ts_code=ts_code, start_date=start_date, end_date=end_date)
-        return df
 
     def get_stock_basic(self, ts_code):
         """
@@ -380,22 +320,6 @@ class ChipDistributionAnalyzer:
         if symbol.endswith(".SZ"):
             symbol = symbol.replace(".SZ", "")
         return ak.stock_zyjs_ths(symbol=symbol)
-
-    def get_main_business_dc(self, symbol):
-        """
-        通过东财接口获取个股主营构成数据。
-
-        参数示例:
-        symbol = "600000"
-
-        返回值示例:
-        返回 `pd.DataFrame` 或标准化后的结构化对象。
-        """
-        if symbol.endswith(".SH"):
-            symbol = symbol.replace(".SH", "")
-        if symbol.endswith(".SZ"):
-            symbol = symbol.replace(".SZ", "")
-        return ak.stock_zygc_em(symbol=symbol)
 
     def get_emotion(self):
         """

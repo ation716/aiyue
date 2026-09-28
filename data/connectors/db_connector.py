@@ -1,29 +1,57 @@
 """只读查询接口；直接运行可逐个调试。使用用户授权的本机默认连接配置，环境变量可覆盖。"""
-import os
 import re
+import sys
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 import pandas as pd
 import pymysql
 
+try:
+    from data.collectors.mysql_config import MySQLTables, make_mysql_config
+except ModuleNotFoundError as exc:
+    if exc.name not in {"data", "data.collectors"}:
+        raise
+    # 兼容直接执行本文件：python data/connectors/db_connector.py
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "collectors"))
+    from ..collectors.mysql_config import MySQLTables, make_mysql_config
+
 
 class DBConnector:
-    DAILY = "stock_daily_kline_20220101_1314"
-    COLUMNS = "ts_code,symbol,trade_date,open,high,low,close,change_amount,vol,amount,turnover_rate,outstanding_share,float_mv"
+    COLUMNS = "symbol,trade_date,open,high,low,close,vol,turnover_rate,outstanding_share"
 
-    def __init__(self, host=None, port=None, user=None, password=None, database=None):
-        self.options = dict(host=host or os.getenv("DB_HOST", "127.0.0.1"),
-                            port=int(port or os.getenv("DB_PORT", "3306")),
-                            user=user or os.getenv("DB_USER", "root"),
-                            password=password if password is not None else os.getenv("DB_PASSWORD", "root"),
-                            database=database or os.getenv("DB_NAME", "security"),
-                            charset="utf8mb4", connect_timeout=10, read_timeout=120)
+    @property
+    def DAILY(self):
+        """兼容旧调用方的日线表访问方式；表名以实例配置为准。"""
+        return self.tables.daily
+
+    def __init__(self, host=None, port=None, user=None, password=None, database=None, tables=None):
+        db_config = make_mysql_config(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database,
+        )
+        self.tables = MySQLTables(**tables) if isinstance(tables, dict) else (tables or MySQLTables.from_env())
+        if not isinstance(self.tables, MySQLTables):
+            raise TypeError("tables 必须是 MySQLTables 或包含对应字段的字典")
+        self.options = dict(
+            host=db_config.host,
+            port=db_config.port,
+            user=db_config.user,
+            password=db_config.password,
+            database=db_config.database,
+            charset=db_config.charset,
+            connect_timeout=db_config.connect_timeout,
+            read_timeout=120,
+        )
         self.connection = None
 
     def connect(self):
         if self.connection is None or not self.connection.open:
             if self.options["password"] is None:
-                raise ValueError("请设置 DB_PASSWORD 或传入 password")
+                raise ValueError("请设置 MYSQL_PASSWORD 或传入 password")
             conn = pymysql.connect(**self.options)
             try:
                 with conn.cursor() as cur:
@@ -110,31 +138,31 @@ class DBConnector:
                 pass
 
     def get_daily(self, symbols=None, start_date=None, end_date=None):
-        """返回长表日线，None 不限，[] 无对象；排除弃用的 pct_chg。"""
+        """返回长表日线，None 不限，[] 无对象；按六位 symbol 查询。"""
         clauses, params = self._dates(start_date, end_date)
         symbols = self._items(symbols)
         if symbols is not None:
-            bare, full = [], []
+            bare = []
             for symbol in symbols:
                 symbol = symbol.upper()
                 if re.fullmatch(r"\d{6}", symbol):
                     bare.append(symbol)
                 elif re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", symbol):
-                    full.append(symbol)
+                    bare.append(symbol.split(".", 1)[0])
                 else:
                     raise ValueError("代码应为六位数字或带 SH/SZ/BJ 后缀")
-            clauses.append("(" + self._in("symbol", bare) + " OR " + self._in("ts_code", full) + ")")
-            params.extend(bare + full)
-        return self._query("SELECT " + self.COLUMNS + " FROM " + self.DAILY + self._where(clauses) + " ORDER BY ts_code,trade_date", params)
+            clauses.append(self._in("symbol", bare))
+            params.extend(bare)
+        return self._query("SELECT " + self.COLUMNS + " FROM " + self.DAILY + self._where(clauses) + " ORDER BY symbol,trade_date", params)
 
     def get_concept_members(self, concepts=None):
         """一个 DataFrame；同一对象的不同概念关系分别保留。"""
         names = self._items(concepts)
         clauses = [] if names is None else [self._in("concept_name", names)]
-        return self._query("SELECT concept_name,ts_code,symbol,stock_name FROM stock_concept_mapping" + self._where(clauses) + " ORDER BY concept_name,ts_code", names or [])
+        return self._query("SELECT concept_name,symbol,stock_name FROM " + self.tables.concept_mapping + self._where(clauses) + " ORDER BY concept_name,symbol", names or [])
 
     def get_concept_names(self):
-        return self._query("SELECT DISTINCT concept_name FROM stock_concept_mapping ORDER BY concept_name")["concept_name"].tolist()
+        return self._query("SELECT DISTINCT concept_name FROM " + self.tables.concept_mapping + " ORDER BY concept_name")["concept_name"].tolist()
 
     def get_concept_daily(self, concepts=None, start_date=None, end_date=None):
         """按概念返回列表，空表通过 attrs['concept_name'] 标识。"""
@@ -147,13 +175,13 @@ class DBConnector:
             clauses, params = self._dates(start_date, end_date, "d.")
             clauses.insert(0, "m.concept_name=%s")
             columns = ",".join("d." + c for c in self.COLUMNS.split(","))
-            df = self._query("SELECT m.concept_name," + columns + " FROM " + self.DAILY + " d JOIN stock_concept_mapping m ON d.ts_code=m.ts_code" + self._where(clauses) + " ORDER BY d.ts_code,d.trade_date", [name] + params)
+            df = self._query("SELECT m.concept_name," + columns + " FROM " + self.DAILY + " d JOIN " + self.tables.concept_mapping + " m ON d.symbol=m.symbol" + self._where(clauses) + " ORDER BY d.symbol,d.trade_date", [name] + params)
             df.attrs["concept_name"] = name
             result.append(df)
         return result
 
     def get_events(self, event_types=None, start_date=None, end_date=None):
-        """默认返回 zt、dt、zb 三张表；百分数值原样返回。"""
+        """异动统计 默认返回 zt、dt、zb 三张表；百分数值原样返回。"""
         kinds = self._items(event_types)
         if kinds is None:
             kinds = ["zt", "dt", "zb"]
@@ -162,109 +190,41 @@ class DBConnector:
         clauses, params = self._dates(start_date, end_date)
         result = []
         for kind in kinds:
-            df = self._query("SELECT * FROM limit_pool_daily" + self._where(["pool_type=%s"] + clauses) + " ORDER BY trade_date,ts_code", [kind] + params)
+            df = self._query("SELECT * FROM " + self.tables.limit_pool_daily + self._where(["pool_type=%s"] + clauses) + " ORDER BY trade_date,ts_code", [kind] + params)
             df.attrs["pool_type"] = kind
             result.append(df)
         return result
 
-    def get_daily_market_counts(self, start_date, end_date):
-        """每日两时点事后统计（MySQL 8+），不是开盘可用信号。
-
-        仅统计主板代码前缀，vol/amount 正值仅作活跃记录过滤。
-        参考价为每个代码当前日期之前最近一条有效 close，不要求该代码存在于统一日历紧邻前日。
-        prev_trade_date 可用于识别跨越缺失日期的复牌参考；不补造缺失日记录。
-        不查询 limit_pool_daily；该表仅可在调试入口通过 res5 作为人工校验参考。
-        当前日线字段没有名称，不能从主数据源可靠排除 ST/*ST。
-        """
-        if start_date is None or end_date is None:
-            raise ValueError("必须提供起始和结束日期")
-        _, params = self._dates(start_date, end_date)
-        sql = f"""
-        WITH dates AS (
-            SELECT DISTINCT trade_date FROM {self.DAILY}
-            WHERE trade_date <= %s
-        ), calendar AS (
-            SELECT trade_date, LAG(trade_date) OVER (ORDER BY trade_date) AS prev_date
-            FROM dates
-        ), active AS (
-            SELECT d.ts_code, d.trade_date, d.open, d.close,
-              p.close AS prev_close, p.trade_date AS prev_trade_date
-            FROM {self.DAILY} d
-            LEFT JOIN {self.DAILY} p
-              ON p.ts_code=d.ts_code AND p.trade_date=(
-                SELECT p0.trade_date FROM {self.DAILY} p0
-                WHERE p0.ts_code=d.ts_code AND p0.trade_date<d.trade_date
-                  AND p0.close>0
-                ORDER BY p0.trade_date DESC LIMIT 1
-              )
-            WHERE d.trade_date BETWEEN %s AND %s
-              AND d.vol>0 AND d.amount>0
-              AND SUBSTRING_INDEX(d.ts_code, '.', 1) REGEXP '^(000|001|002|003|600|601|603|605)'
-        ), direction_counts AS (
-            SELECT trade_date, COUNT(DISTINCT ts_code) AS active_count,
-              COUNT(DISTINCT CASE WHEN prev_close>0 AND open>0 AND open>prev_close THEN ts_code END) AS open_up,
-              COUNT(DISTINCT CASE WHEN prev_close>0 AND open>0 AND open<prev_close THEN ts_code END) AS open_down,
-              COUNT(DISTINCT CASE WHEN prev_close>0 AND close>0 AND close>prev_close THEN ts_code END) AS close_up,
-              COUNT(DISTINCT CASE WHEN prev_close>0 AND close>0 AND close<prev_close THEN ts_code END) AS close_down,
-              COUNT(DISTINCT CASE WHEN prev_close>0 AND open>0 THEN ts_code END) AS open_valid,
-              COUNT(DISTINCT CASE WHEN prev_close>0 AND close>0 THEN ts_code END) AS close_valid,
-              COUNT(DISTINCT CASE WHEN prev_close>0 AND open>0 AND open >= ROUND(prev_close * 1.10, 2) THEN ts_code END) AS open_limit_up,
-              COUNT(DISTINCT CASE WHEN prev_close>0 AND open>0 AND open <= ROUND(prev_close * 0.90, 2) THEN ts_code END) AS open_limit_down,
-              COUNT(DISTINCT CASE WHEN prev_close>0 AND close>0 AND close >= ROUND(prev_close * 1.10, 2) THEN ts_code END) AS close_limit_up,
-              COUNT(DISTINCT CASE WHEN prev_close>0 AND close>0 AND close <= ROUND(prev_close * 0.90, 2) THEN ts_code END) AS close_limit_down
-            FROM active GROUP BY trade_date
+    def get_symbols_concept(self, symbols=None):
+        """按六位 symbol 返回概念映射记录。"""
+        symbols = self._items(symbols)
+        clauses = [] if symbols is None else [self._in("symbol", symbols)]
+        return self._query(
+            "SELECT concept_name,symbol,stock_name FROM " + self.tables.concept_mapping
+            + self._where(clauses) + " ORDER BY symbol,concept_name",
+            symbols or [],
         )
-        SELECT c.trade_date, COALESCE(d.active_count,0) AS active_count,
-          COALESCE(d.open_up,0) AS open_up, COALESCE(d.open_down,0) AS open_down,
-          COALESCE(d.close_up,0) AS close_up, COALESCE(d.close_down,0) AS close_down,
-          COALESCE(d.open_valid,0) AS open_valid, COALESCE(d.close_valid,0) AS close_valid,
-          COALESCE(d.open_limit_up,0) AS open_limit_up, COALESCE(d.open_limit_down,0) AS open_limit_down,
-          COALESCE(d.close_limit_up,0) AS close_limit_up, COALESCE(d.close_limit_down,0) AS close_limit_down
-        FROM calendar c LEFT JOIN direction_counts d ON c.trade_date=d.trade_date
-        WHERE c.trade_date BETWEEN %s AND %s ORDER BY c.trade_date
-        """
-        daily = self._query(sql, [params[1], params[0], params[1], params[0], params[1]])
-        columns = ["trade_date", "snapshot", "up_count", "down_count", "limit_up_count",
-                   "limit_down_count", "active_count", "direction_valid_count", "limit_count_status"]
-        frames = []
-        for snapshot in ("open", "close"):
-            frame = daily[["trade_date", "active_count"]].copy()
-            frame["snapshot"] = snapshot
-            frame["up_count"] = daily[snapshot + "_up"]
-            frame["down_count"] = daily[snapshot + "_down"]
-            frame["direction_valid_count"] = daily[snapshot + "_valid"]
-            frame["limit_up_count"] = daily[snapshot + "_limit_up"]
-            frame["limit_down_count"] = daily[snapshot + "_limit_down"]
-            frame["limit_count_status"] = "price_calculated_mainboard_only"
-            frame["_order"] = 0 if snapshot == "open" else 1
-            frames.append(frame)
-        result = pd.concat(frames, ignore_index=True).sort_values(["trade_date", "_order"])
-        result = result[columns].reset_index(drop=True)
-        for col in columns[2:-1]:
-            result[col] = result[col].astype("int64")
-        result.attrs["usage"] = "事后统计；日终成交量额过滤不能用于开盘决策"
-        result.attrs["calendar"] = "长表日期并集；非独立交易日历"
-        result.attrs["limits"] = "开盘和收盘均按前收盘及主板10%限制比例计算；未查询日池"
-        result.attrs["scope"] = "仅统计代码前缀000/001/002/003/600/601/603/605的主板对象；不单独识别ST/*ST"
-        result.attrs["validation"] = "可用 res5 的 limit_pool_daily zt/dt 结果人工校验；接口本身不读取日池"
-        return result
 
     def get_weekly(self, symbols=None, start_date=None, end_date=None):
-        """自然周聚合，先截日期区间；换手率采用累计口径，非去重比例。"""
-        columns = "ts_code,symbol,trade_date,open,high,low,close,vol,amount,turnover_rate".split(",")
+        """自然周聚合；日线表没有 amount 时不虚构该列。"""
+        columns = "symbol,trade_date,open,high,low,close,vol,turnover_rate".split(",")
         df = self.get_daily(symbols, start_date, end_date)
         if df.empty:
             return pd.DataFrame(columns=columns)
-        df = df.sort_values(["ts_code", "trade_date"]).copy()
+        df = df.sort_values(["symbol", "trade_date"]).copy()
         df["week"] = df.trade_date.dt.to_period("W-SUN")
-        def strict_sum(s):
-            return s.sum(min_count=len(s))
-        result = df.groupby(["ts_code", "week"], sort=True).agg(
-            symbol=("symbol", lambda s: s.iloc[-1]),
-            trade_date=("trade_date", "max"), open=("open", lambda s: s.iloc[0]),
-            high=("high", lambda s: s.max(skipna=False)), low=("low", lambda s: s.min(skipna=False)),
-            close=("close", lambda s: s.iloc[-1]), vol=("vol", strict_sum),
-            amount=("amount", strict_sum), turnover_rate=("turnover_rate", strict_sum)
+
+        def strict_sum(series):
+            return series.sum(min_count=len(series))
+
+        result = df.groupby(["symbol", "week"], sort=True).agg(
+            trade_date=("trade_date", "max"),
+            open=("open", lambda s: s.iloc[0]),
+            high=("high", lambda s: s.max(skipna=False)),
+            low=("low", lambda s: s.min(skipna=False)),
+            close=("close", lambda s: s.iloc[-1]),
+            vol=("vol", strict_sum),
+            turnover_rate=("turnover_rate", strict_sum),
         ).reset_index()
         return result[columns]
 
@@ -282,12 +242,11 @@ if __name__ == "__main__":
 
     # 使用本机默认连接配置，环境变量可覆盖；退出 with 自动关闭连接。
     with DBConnector() as cn:
-        # res1 = cn.get_daily('603221', '2026-07-23', '2026-08-23')
+        res1 = cn.get_daily("603221", "2026-08-21", "2026-08-24")
         # res2 = cn.get_concept_members(concept_test)
         res3 = cn.get_concept_names()
         # res4 = cn.get_concept_daily(concept_test, start, end)
-        res5 = cn.get_events(event_types, start, end)
+        # res5 = cn.get_events(event_types, start, end)
         # res6 = cn.get_weekly(symbol_test, start, end)
-        # res7 = cn.get_daily_market_counts(start, end)  # 全部活跃对象，不受 symbol_test 限制
-    # 在下面一行打断点，可查看 res1～res7；不打印、不执行对照测试。
+    # 在下面一行打断点，可查看 res1～res6；不打印、不执行对照测试。
     pass

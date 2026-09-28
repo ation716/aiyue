@@ -15,7 +15,38 @@ MYSQL_HOST、MYSQL_PORT、MYSQL_USER、MYSQL_PASSWORD、MYSQL_DATABASE。
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class MySQLTables:
+    """可按连接实例覆盖的逻辑表映射。表名仅允许安全 SQL 标识符字符。"""
+
+    daily: str = "stock_daily_kline_20260101_200"
+    concept_mapping: str = "stock_concept_mapping"
+    limit_pool_daily: str = "limit_pool_daily"
+    index_daily_kline: str = "index_daily_kline"
+    industry_pool_stat: str = "industry_pool_stat"  # 按日期统计各行业的涨停、炸板和跌停数量等数据
+
+    def __post_init__(self):
+        for field_name in (
+            "daily", "concept_mapping", "limit_pool_daily",
+            "index_daily_kline", "industry_pool_stat",
+        ):
+            table_name = getattr(self, field_name)
+            if not isinstance(table_name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_name):
+                raise ValueError(f"{field_name} 必须是合法的 SQL 表标识符")
+
+    @classmethod
+    def from_env(cls, prefix: str = "MYSQL_TABLE_") -> "MySQLTables":
+        return cls(
+            daily=os.getenv(f"{prefix}DAILY", cls.daily),
+            concept_mapping=os.getenv(f"{prefix}CONCEPT_MAPPING", cls.concept_mapping),
+            limit_pool_daily=os.getenv(f"{prefix}LIMIT_POOL_DAILY", cls.limit_pool_daily),
+            index_daily_kline=os.getenv(f"{prefix}INDEX_DAILY_KLINE", cls.index_daily_kline),
+            industry_pool_stat=os.getenv(f"{prefix}INDUSTRY_POOL_STAT", cls.industry_pool_stat),
+        )
 
 
 @dataclass(frozen=True)
@@ -39,7 +70,7 @@ class MySQLConfig:
     host: str = "127.0.0.1"
     port: int = 3306
     user: str = "root"
-    password: str = "root"
+    password: str = "mysql"
     database: str = "security"
     charset: str = "utf8mb4"
     connect_timeout: int = 10
