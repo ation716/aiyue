@@ -70,16 +70,45 @@ def choose(day, daily, calendar, params, account):
 
 
 def _sell_signals(account, params):
-    """按止盈、止损、持有天数三条件生成卖出信号；价格为当日收盘价。"""
+    """按相对基准表现、绝对止盈止损和持有天数生成卖出信号。"""
     sell = {}
+    benchmark_price = params.get("benchmark_price", {})
+    benchmark_entry_price = params.get("benchmark_entry_price", {})
+    benchmark_symbol = params.get("benchmark_symbol", "000001")
+    benchmark_enabled = bool(params.get("benchmark_enabled", False))
     for symbol, record in account["hold"].items():
         price = params.get("close_price", {}).get(symbol)
-        cost = record["cost_price"]
-        if price is None:
+        cost = float(record["cost_price"])
+        if price is None or cost <= 0:
             continue
+        price = float(price)
         gain = price / cost - 1
         held_days = params.get("held_days", {}).get(symbol, 0)
-        if gain >= params["take_profit"] or gain <= -params["stop_loss"] or held_days >= params["hold_days"]:
-            sell[symbol] = {"sell": str(round(price, 2)), "vol": record["vol"],
-                            "other": {"gain": float(gain), "held_days": held_days}}
+
+        relative_gain = None
+        relative_reason = None
+        entry_benchmark = benchmark_entry_price.get(symbol)
+        current_benchmark = benchmark_price.get(benchmark_symbol)
+        if benchmark_enabled and entry_benchmark is not None and current_benchmark is not None and float(entry_benchmark) > 0:
+            benchmark_gain = float(current_benchmark) / float(entry_benchmark) - 1
+            relative_gain = gain - benchmark_gain
+            if relative_gain <= -float(params.get("relative_stop_loss", 0.08)):
+                relative_reason = "relative_stop_loss"
+            elif relative_gain >= float(params.get("relative_take_profit", 0.10)):
+                relative_reason = "relative_take_profit"
+
+        absolute_reason = None
+        if gain >= float(params["take_profit"]):
+            absolute_reason = "take_profit"
+        elif gain <= -float(params["stop_loss"]):
+            absolute_reason = "stop_loss"
+        elif held_days >= params["hold_days"]:
+            absolute_reason = "hold_days"
+
+        reason = relative_reason or absolute_reason
+        if reason:
+            other = {"gain": gain, "held_days": held_days, "sell_reason": reason}
+            if relative_gain is not None:
+                other["relative_gain"] = relative_gain
+            sell[symbol] = {"sell": str(round(price, 2)), "vol": record["vol"], "other": other}
     return sell

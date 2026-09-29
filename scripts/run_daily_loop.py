@@ -3,6 +3,7 @@ import argparse
 import ast
 from datetime import datetime
 import hashlib
+import importlib
 import json
 from pathlib import Path
 import platform
@@ -15,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 
 STRAT = "daily"
 # PyCharm 右键直接运行时使用这个实验；切换实验只需修改这一行。
-DEFAULT_EXPERIMENT = "E07"
+DEFAULT_EXPERIMENT = "E11"
 
 
 def dump(path, value):
@@ -66,12 +67,15 @@ def main():
         import pandas as pd
 
         from data.connectors.db_connector import DBConnector
-        from scoring.strategies import strategy1
         from backtest.daily_loop import run_daily
         from backtest.result_store import save_result_files
 
         stage = "configuration"
         cfg = configuration(args.experiment)
+        strategy_module_name = cfg.get("strategy_module", "scoring.strategies.strategy1")
+        strategy = importlib.import_module(strategy_module_name)
+        if not hasattr(strategy, "choose"):
+            raise ValueError(f"策略模块缺少 choose：{strategy_module_name}")
         dump(directory / "config.json", cfg)
         metadata.update({"python_version": platform.python_version(),
                          "pandas_version": pd.__version__, "numpy_version": np.__version__,
@@ -82,8 +86,9 @@ def main():
         dump(directory / "metadata.json", metadata)
         print(json.dumps({"status": "started", "run_id": run_id, "stage": stage,
                           "directory": str(directory)}, ensure_ascii=True), flush=True)
+        strategy_file = Path(strategy.__file__).resolve()
         for name in ["backtest/broker.py", "backtest/trading.py", "backtest/daily_loop.py",
-                     "portfolio/allocate.py", "scoring/strategies/strategy1/choose.py"]:
+                     "portfolio/allocate.py", str(strategy_file.relative_to(ROOT))]:
             ast.parse((ROOT / name).read_text(encoding="utf-8"), filename=name)
 
         frame = None
@@ -96,6 +101,13 @@ def main():
                               "table": db.tables.daily, "start": cfg["start"], "end": cfg["end"]},
                              ensure_ascii=True), flush=True)
             frame = db.get_daily(start_date=cfg["start"], end_date=cfg["end"])
+            benchmark_frame = None
+            if cfg.get("benchmark_enabled"):
+                benchmark_frame = db.get_index_daily_close(
+                    symbol=cfg.get("benchmark_symbol", "000001"),
+                    start_date=cfg["start"],
+                    end_date=cfg["end"],
+                )
         if frame is None or frame.empty:
             raise ValueError("未取得真实日线，停止而不补造")
         print(json.dumps({"status": "running", "run_id": run_id, "stage": stage,
@@ -132,7 +144,8 @@ def main():
                           "rows": len(frame), "days": len(calendar),
                           "symbols": int(frame.ts_code.nunique())}, ensure_ascii=True), flush=True)
         log_path = ROOT / "logs" / f"{STRAT}_{args.experiment}_{run_id}.log"
-        result = run_daily(frame, calendar, strategy1, cfg, log_path=log_path)
+        result = run_daily(frame, calendar, strategy, cfg, log_path=log_path,
+                           benchmark_daily=benchmark_frame)
         if not result["equity"]:
             raise ValueError("回测未产生任何账户记录")
         for name in ("trades", "equity", "order_log", "final"):

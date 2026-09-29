@@ -1,10 +1,10 @@
 # Scaffold uses only the Python standard library.
 # Proposed optional dependencies below are NOT installed or version-verified.
 # Enable and pin only when implementing the corresponding adapter.
-# pandas
-# numpy
+pandas>=3.0,<4
+numpy>=2.5,<3
+pymysql>=1.1,<2
 # sqlalchemy
-# pymysql
 # psycopg[binary]
 # akshare
 # tushare

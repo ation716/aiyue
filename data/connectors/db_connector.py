@@ -239,6 +239,25 @@ class DBConnector:
             params,
         )
 
+    def get_index_daily_close(self, symbol="000001", start_date=None, end_date=None):
+        """返回指定指数的日线收盘价，供相对表现退出规则使用。
+
+        symbol 使用指数表中的六位代码，不带交易所后缀；返回 trade_date、symbol、close。
+        该方法只读查询，不对缺失日期补值。
+        """
+        if start_date is None or end_date is None:
+            raise ValueError("start_date 和 end_date 均不能为空")
+        if not isinstance(symbol, str) or not re.fullmatch(r"\d{6}", symbol):
+            raise ValueError("指数代码应为六位数字")
+        clauses, params = self._dates(start_date, end_date)
+        clauses.append("symbol=%s")
+        params.append(symbol)
+        return self._query(
+            "SELECT symbol,trade_date,close FROM " + self.tables.index_daily_kline
+            + self._where(clauses) + " ORDER BY trade_date",
+            params,
+        )
+
     def get_main_board_equal_weighted_change(self, start_date=None, end_date=None):
         """按日期返回主板对象等权平均涨幅。
 
